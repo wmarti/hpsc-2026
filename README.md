@@ -1,6 +1,6 @@
 # hpc_lecture
 
-Student ID:
+Student ID: 25M38120 - Will Martin
 
 |          | Topic                                | Sample code               |
 | -------- | ------------------------------------ | ------------------------- |
