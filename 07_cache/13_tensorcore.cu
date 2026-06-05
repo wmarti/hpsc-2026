@@ -1,7 +1,7 @@
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cmath>
 #include <vector>
 
 #include <cublas_v2.h>
@@ -31,10 +31,10 @@ using namespace nvcuda;
     }                                                                        \
   } while (0)
 
-constexpr int kBlockM = 128;
-constexpr int kBlockN = 128;
-constexpr int kBlockK = 64;
-constexpr int kThreads = 256;
+constexpr int kTileM = 320;
+constexpr int kTileN = 64;
+constexpr int kBlockK = 16;
+constexpr int kThreads = 320;
 
 __global__ void init_float_kernel(float *ptr, int64_t count, int seed) {
   int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -55,161 +55,15 @@ __global__ void fp32_to_half_kernel(const float *in, half *out, int64_t count) {
 }
 
 __global__ __launch_bounds__(kThreads, 2)
-void wmma_128x128x64_kernel(int dim_m, int dim_n, int dim_k,
-                            const half *__restrict__ a,
-                            const half *__restrict__ b,
-                            float *__restrict__ c) {
-  __shared__ __align__(256) half tile_a[kBlockK][kBlockM];
-  __shared__ __align__(256) half tile_b[kBlockK][kBlockN];
-
-  int block_m = blockIdx.x * kBlockM;
-  int block_n = blockIdx.y * kBlockN;
-  int warp_id = threadIdx.x >> 5;
-  int warp_m = warp_id >> 1;
-  int warp_n = warp_id & 1;
-
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      wmma::fill_fragment(acc[r][n], 0.0f);
-    }
-  }
-
-  for (int block_k = 0; block_k < dim_k; block_k += kBlockK) {
-    for (int idx = threadIdx.x; idx < kBlockK * kBlockM; idx += kThreads) {
-      int kk = idx / kBlockM;
-      int mm = idx - kk * kBlockM;
-      tile_a[kk][mm] = a[(block_k + kk) * dim_m + block_m + mm];
-    }
-    for (int idx = threadIdx.x; idx < kBlockK * kBlockN; idx += kThreads) {
-      int kk = idx / kBlockN;
-      int nn = idx - kk * kBlockN;
-      tile_b[kk][nn] = b[(block_n + nn) * dim_k + block_k + kk];
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int kk = 0; kk < kBlockK; kk += 16) {
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
-          b_frag[4];
-#pragma unroll
-      for (int n = 0; n < 4; ++n) {
-        int col = warp_n * 64 + n * 16;
-        wmma::load_matrix_sync(b_frag[n], &tile_b[kk][col], kBlockN);
-      }
-
-#pragma unroll
-      for (int r = 0; r < 2; ++r) {
-        int row = warp_m * 32 + r * 16;
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major>
-            a_frag;
-        wmma::load_matrix_sync(a_frag, &tile_a[kk][row], kBlockM);
-#pragma unroll
-        for (int n = 0; n < 4; ++n) {
-          wmma::mma_sync(acc[r][n], a_frag, b_frag[n], acc[r][n]);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-    int row = block_m + warp_m * 32 + r * 16;
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      int col = block_n + warp_n * 64 + n * 16;
-      wmma::store_matrix_sync(&c[col * dim_m + row], acc[r][n], dim_m,
-                              wmma::mem_col_major);
-    }
-  }
-}
-
-__global__ __launch_bounds__(kThreads, 2)
-void wmma_shared_row_128x128x64_kernel(int dim_m, int dim_n, int dim_k,
-                                       const half *__restrict__ a,
-                                       const half *__restrict__ b,
-                                       float *__restrict__ c) {
-  __shared__ __align__(256) half tile_a[kBlockM][kBlockK];
-  __shared__ __align__(256) half tile_b[kBlockK][kBlockN];
-
-  int block_m = blockIdx.x * kBlockM;
-  int block_n = blockIdx.y * kBlockN;
-  int warp_id = threadIdx.x >> 5;
-  int warp_m = warp_id >> 1;
-  int warp_n = warp_id & 1;
-
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      wmma::fill_fragment(acc[r][n], 0.0f);
-    }
-  }
-
-  for (int block_k = 0; block_k < dim_k; block_k += kBlockK) {
-    for (int idx = threadIdx.x; idx < kBlockK * kBlockM; idx += kThreads) {
-      int kk = idx / kBlockM;
-      int mm = idx - kk * kBlockM;
-      tile_a[mm][kk] = a[(block_k + kk) * dim_m + block_m + mm];
-    }
-    for (int idx = threadIdx.x; idx < kBlockK * kBlockN; idx += kThreads) {
-      int kk = idx / kBlockN;
-      int nn = idx - kk * kBlockN;
-      tile_b[kk][nn] = b[(block_n + nn) * dim_k + block_k + kk];
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int kk = 0; kk < kBlockK; kk += 16) {
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
-          b_frag[4];
-#pragma unroll
-      for (int n = 0; n < 4; ++n) {
-        int col = warp_n * 64 + n * 16;
-        wmma::load_matrix_sync(b_frag[n], &tile_b[kk][col], kBlockN);
-      }
-
-#pragma unroll
-      for (int r = 0; r < 2; ++r) {
-        int row = warp_m * 32 + r * 16;
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>
-            a_frag;
-        wmma::load_matrix_sync(a_frag, &tile_a[row][kk], kBlockK);
-#pragma unroll
-        for (int n = 0; n < 4; ++n) {
-          wmma::mma_sync(acc[r][n], a_frag, b_frag[n], acc[r][n]);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-    int row = block_m + warp_m * 32 + r * 16;
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      int col = block_n + warp_n * 64 + n * 16;
-      wmma::store_matrix_sync(&c[col * dim_m + row], acc[r][n], dim_m,
-                              wmma::mem_col_major);
-    }
-  }
-}
-
-__global__ __launch_bounds__(kThreads, 2)
-void wmma_global_128x128_kernel(int dim_m, int dim_n, int dim_k,
+void wmma_bshared_320x64_kernel(int dim_m, int dim_n, int dim_k,
                                 const half *__restrict__ a,
                                 const half *__restrict__ b,
                                 float *__restrict__ c) {
-  int block_m = blockIdx.x * kBlockM;
-  int block_n = blockIdx.y * kBlockN;
+  __shared__ __align__(128) half tile_b[kTileN * kBlockK];
+
+  int block_m = blockIdx.x * kTileM;
+  int block_n = blockIdx.y * kTileN;
   int warp_id = threadIdx.x >> 5;
-  int warp_m = warp_id >> 1;
-  int warp_n = warp_id & 1;
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
 #pragma unroll
@@ -220,18 +74,24 @@ void wmma_global_128x128_kernel(int dim_m, int dim_n, int dim_k,
     }
   }
 
-  for (int kk = 0; kk < dim_k; kk += 16) {
+  for (int kk = 0; kk < dim_k; kk += kBlockK) {
+    for (int idx = threadIdx.x; idx < kTileN * kBlockK; idx += kThreads) {
+      int col = idx / kBlockK;
+      int inner_k = idx - col * kBlockK;
+      tile_b[idx] = b[(block_n + col) * dim_k + kk + inner_k];
+    }
+    __syncthreads();
+
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>
         b_frag[4];
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
-      int col = block_n + warp_n * 64 + n * 16;
-      wmma::load_matrix_sync(b_frag[n], &b[col * dim_k + kk], dim_k);
+      wmma::load_matrix_sync(b_frag[n], &tile_b[n * 16 * kBlockK], kBlockK);
     }
 
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
-      int row = block_m + warp_m * 32 + r * 16;
+      int row = block_m + warp_id * 32 + r * 16;
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major>
           a_frag;
       wmma::load_matrix_sync(a_frag, &a[kk * dim_m + row], dim_m);
@@ -240,72 +100,15 @@ void wmma_global_128x128_kernel(int dim_m, int dim_n, int dim_k,
         wmma::mma_sync(acc[r][n], a_frag, b_frag[n], acc[r][n]);
       }
     }
+    __syncthreads();
   }
 
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
-    int row = block_m + warp_m * 32 + r * 16;
+    int row = block_m + warp_id * 32 + r * 16;
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
-      int col = block_n + warp_n * 64 + n * 16;
-      wmma::store_matrix_sync(&c[col * dim_m + row], acc[r][n], dim_m,
-                              wmma::mem_col_major);
-    }
-  }
-}
-
-template <int TileM, int TileN, int WarpsM, int WarpsN>
-__global__ __launch_bounds__(WarpsM * WarpsN * 32, 4)
-void wmma_global_tiled_kernel(int dim_m, int dim_n, int dim_k,
-                              const half *__restrict__ a,
-                              const half *__restrict__ b,
-                              float *__restrict__ c) {
-  static_assert(TileM == WarpsM * 32);
-  static_assert(TileN == WarpsN * 64);
-
-  int block_m = blockIdx.x * TileM;
-  int block_n = blockIdx.y * TileN;
-  int warp_id = threadIdx.x >> 5;
-  int warp_m = warp_id / WarpsN;
-  int warp_n = warp_id - warp_m * WarpsN;
-
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      wmma::fill_fragment(acc[r][n], 0.0f);
-    }
-  }
-
-  for (int kk = 0; kk < dim_k; kk += 16) {
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>
-        b_frag[4];
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      int col = block_n + warp_n * 64 + n * 16;
-      wmma::load_matrix_sync(b_frag[n], &b[col * dim_k + kk], dim_k);
-    }
-
-#pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      int row = block_m + warp_m * 32 + r * 16;
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major>
-          a_frag;
-      wmma::load_matrix_sync(a_frag, &a[kk * dim_m + row], dim_m);
-#pragma unroll
-      for (int n = 0; n < 4; ++n) {
-        wmma::mma_sync(acc[r][n], a_frag, b_frag[n], acc[r][n]);
-      }
-    }
-  }
-
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-    int row = block_m + warp_m * 32 + r * 16;
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      int col = block_n + warp_n * 64 + n * 16;
+      int col = block_n + n * 16;
       wmma::store_matrix_sync(&c[col * dim_m + row], acc[r][n], dim_m,
                               wmma::mem_col_major);
     }
@@ -398,11 +201,12 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "usage: %s [m k n iterations]\n", argv[0]);
     return EXIT_FAILURE;
   }
-  if ((m % kBlockM) != 0 || (n % kBlockN) != 0 || (k % kBlockK) != 0) {
+  if ((m % kTileM) != 0 || (n % kTileN) != 0 || (k % kBlockK) != 0) {
     std::fprintf(stderr,
-                 "This H100 kernel requires m,n multiples of 128 and k a "
-                 "multiple of 64. Got m=%d k=%d n=%d.\n",
-                 m, k, n);
+                 "This sm_90 Tensor Core kernel requires m a multiple of %d, "
+                 "n a multiple of %d, and k a multiple of %d. Got m=%d k=%d "
+                 "n=%d.\n",
+                 kTileM, kTileN, kBlockK, m, k, n);
     return EXIT_FAILURE;
   }
 
@@ -456,98 +260,30 @@ int main(int argc, char **argv) {
                               CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   }, iterations);
 
-  dim3 block(kThreads);
-  dim3 grid(m / kBlockM, n / kBlockN);
-  CHECK_CUDA(cudaFuncSetAttribute(
-      wmma_128x128x64_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-      cudaSharedmemCarveoutMaxShared));
-
+  dim3 grid(m / kTileM, n / kTileN);
   float raw_ms = time_cuda_operation([&]() {
-    wmma_128x128x64_kernel<<<grid, block>>>(m, n, k, a16, b16, c_raw);
+    wmma_bshared_320x64_kernel<<<grid, kThreads>>>(m, n, k, a16, b16, c_raw);
     CHECK_CUDA(cudaGetLastError());
   }, iterations);
 
-  float raw_shared_row_ms = time_cuda_operation([&]() {
-    wmma_shared_row_128x128x64_kernel<<<grid, block>>>(m, n, k, a16, b16,
-                                                       c_raw);
-    CHECK_CUDA(cudaGetLastError());
-  }, iterations);
-
-  float raw_global_ms = time_cuda_operation([&]() {
-    wmma_global_128x128_kernel<<<grid, block>>>(m, n, k, a16, b16, c_raw);
-    CHECK_CUDA(cudaGetLastError());
-  }, iterations);
-
-  float raw_global_64x128_ms = time_cuda_operation([&]() {
-    dim3 grid64x128(m / 64, n / 128);
-    wmma_global_tiled_kernel<64, 128, 2, 2><<<grid64x128, 128>>>(
-        m, n, k, a16, b16, c_raw);
-    CHECK_CUDA(cudaGetLastError());
-  }, iterations);
-
-  float raw_global_128x64_ms = time_cuda_operation([&]() {
-    dim3 grid128x64(m / 128, n / 64);
-    wmma_global_tiled_kernel<128, 64, 4, 1><<<grid128x64, 128>>>(
-        m, n, k, a16, b16, c_raw);
-    CHECK_CUDA(cudaGetLastError());
-  }, iterations);
-
-  float raw_global_64x64_ms = time_cuda_operation([&]() {
-    dim3 grid64x64(m / 64, n / 64);
-    wmma_global_tiled_kernel<64, 64, 2, 1><<<grid64x64, 64>>>(
-        m, n, k, a16, b16, c_raw);
-    CHECK_CUDA(cudaGetLastError());
-  }, iterations);
-
-  CHECK_CUDA(cudaDeviceSynchronize());
   double err_vs_half = average_abs_error(c_cublas16, c_raw, size_c);
   double err_vs_fast16f = average_abs_error(c_cublas32, c_raw, size_c);
 
   double cublas32_gflops = gflops_from_ms(m, n, k, cublas32_ms);
   double cublas16_gflops = gflops_from_ms(m, n, k, cublas16_ms);
   double raw_gflops = gflops_from_ms(m, n, k, raw_ms);
-  double raw_shared_row_gflops = gflops_from_ms(m, n, k, raw_shared_row_ms);
-  double raw_global_gflops = gflops_from_ms(m, n, k, raw_global_ms);
-  double raw_global_64x128_gflops =
-      gflops_from_ms(m, n, k, raw_global_64x128_ms);
-  double raw_global_128x64_gflops =
-      gflops_from_ms(m, n, k, raw_global_128x64_ms);
-  double raw_global_64x64_gflops =
-      gflops_from_ms(m, n, k, raw_global_64x64_ms);
 
   std::printf("M=%d K=%d N=%d iterations=%d\n", m, k, n, iterations);
   std::printf("cuBLAS FP32 input FAST_16F: %.3f ms, %.2f Gflop/s\n",
               cublas32_ms, cublas32_gflops);
   std::printf("cuBLAS FP16 input tensor op: %.3f ms, %.2f Gflop/s\n",
               cublas16_ms, cublas16_gflops);
-  std::printf("raw CUDA WMMA shared 128x128x64: %.3f ms, %.2f Gflop/s\n", raw_ms,
-              raw_gflops);
-  std::printf("raw CUDA WMMA shared-row 128x128x64: %.3f ms, %.2f Gflop/s\n",
-              raw_shared_row_ms, raw_shared_row_gflops);
-  std::printf("raw CUDA WMMA global 128x128: %.3f ms, %.2f Gflop/s\n",
-              raw_global_ms, raw_global_gflops);
-  std::printf("raw CUDA WMMA global 64x128: %.3f ms, %.2f Gflop/s\n",
-              raw_global_64x128_ms, raw_global_64x128_gflops);
-  std::printf("raw CUDA WMMA global 128x64: %.3f ms, %.2f Gflop/s\n",
-              raw_global_128x64_ms, raw_global_128x64_gflops);
-  std::printf("raw CUDA WMMA global 64x64: %.3f ms, %.2f Gflop/s\n",
-              raw_global_64x64_ms, raw_global_64x64_gflops);
-  std::printf("shared raw / cuBLAS FP32-input speedup: %.3fx\n",
+  std::printf("raw CUDA WMMA B-shared 320x64: %.3f ms, %.2f Gflop/s\n",
+              raw_ms, raw_gflops);
+  std::printf("raw / cuBLAS FP32-input speedup: %.3fx\n",
               cublas32_ms / raw_ms);
-  std::printf("shared raw / cuBLAS FP16-input speedup: %.3fx\n",
+  std::printf("raw / cuBLAS FP16-input speedup: %.3fx\n",
               cublas16_ms / raw_ms);
-  std::printf("global raw / cuBLAS FP32-input speedup: %.3fx\n",
-              cublas32_ms / raw_global_ms);
-  std::printf("global raw / cuBLAS FP16-input speedup: %.3fx\n",
-              cublas16_ms / raw_global_ms);
-  std::printf("best tiled global / cuBLAS FP32-input speedup: %.3fx\n",
-              cublas32_ms /
-                  fmin(fmin(raw_global_64x128_ms, raw_global_128x64_ms),
-                       raw_global_64x64_ms));
-  std::printf("best tiled global / cuBLAS FP16-input speedup: %.3fx\n",
-              cublas16_ms /
-                  fmin(fmin(raw_global_64x128_ms, raw_global_128x64_ms),
-                       raw_global_64x64_ms));
   std::printf("avg abs error vs cuBLAS FP16 input: %.8e\n", err_vs_half);
   std::printf("avg abs error vs cuBLAS FP32 FAST_16F: %.8e\n",
               err_vs_fast16f);
